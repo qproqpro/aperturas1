@@ -13,19 +13,21 @@ from datetime import datetime, timezone
 MONGO_URI = os.environ.get("MONGODB_URI", "")
 DB_NAME   = os.environ.get("MONGO_DB_NAME", "sbrp")
 
-# Zona horaria de Madrid
+# Zona horaria de Madrid para mostrar las horas correctamente en la web
 MADRID_TZ = zoneinfo.ZoneInfo("Europe/Madrid")
 
 def get_db():
-    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    # Tiempo de espera límite de 4 segundos para evitar congelamientos eternos si falla Atlas
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=4000)
     return client[DB_NAME]["sbrp_sessions"]
 
 # ──────────────────────────────────────────────
-# LÓGICA DE STATS
+# LÓGICA DE PROCESAMIENTO DE ESTADÍSTICAS
 # ──────────────────────────────────────────────
 def fetch_stats():
     col = get_db()
-    # Traemos las últimas 15 sesiones
+    
+    # Obtenemos las últimas 15 sesiones ordenadas por fecha de inicio
     sessions = list(col.find().sort("open_start", -1).limit(15))
 
     if not sessions:
@@ -45,48 +47,58 @@ def fetch_stats():
             "by_hour": [0]*24
         }
 
-    # Estado dinámico y cálculo de tiempos activos
     last_session = sessions[0]
+    # Determinar el estado basándonos estrictamente en el campo status
     server_status = "open" if last_session.get("status") == "open" else "closed"
     
-    # Calcular cuánto lleva abierto o cuándo se cerró
     time_elapsed_seconds = 0
     last_change_time_str = "—"
     
+    # Procesar tiempos si está ABIERTO
     if server_status == "open" and last_session.get("open_start"):
         open_start = last_session["open_start"]
-        if open_start.tzinfo is None:
-            open_start = open_start.replace(tzinfo=timezone.utc)
-        now_utc = datetime.now(timezone.utc)
-        time_elapsed_seconds = int((now_utc - open_start).total_seconds())
-        last_change_time_str = open_start.astimezone(MADRID_TZ).strftime("%H:%M")
+        if isinstance(open_start, datetime):
+            if open_start.tzinfo is None:
+                open_start = open_start.replace(tzinfo=timezone.utc)
+            now_utc = datetime.now(timezone.utc)
+            time_elapsed_seconds = int((now_utc - open_start).total_seconds())
+            last_change_time_str = open_start.astimezone(MADRID_TZ).strftime("%H:%M")
+        else:
+            last_change_time_str = str(open_start)
+
+    # Procesar tiempos si está CERRADO
     elif server_status == "closed" and last_session.get("close_time"):
         close_time = last_session["close_time"]
-        if close_time.tzinfo is None:
-            close_time = close_time.replace(tzinfo=timezone.utc)
-        last_change_time_str = close_time.astimezone(MADRID_TZ).strftime("%d/%m a las %H:%M")
+        if isinstance(close_time, datetime):
+            if close_time.tzinfo is None:
+                close_time = close_time.replace(tzinfo=timezone.utc)
+            last_change_time_str = close_time.astimezone(MADRID_TZ).strftime("%d/%m a las %H:%M")
+        else:
+            last_change_time_str = str(close_time)
 
-    # Filtrar cerradas para promedios
+    # Cálculos globales de analíticas
     closed_sessions = [s for s in sessions if s.get("status") == "closed"]
-    durations = [s["duration_minutes"] for s in closed_sessions if s.get("duration_minutes")]
+    durations = [s["duration_minutes"] for s in closed_sessions if s.get("duration_minutes") and isinstance(s.get("duration_minutes"), (int, float))]
+    
     avg_dur = round(sum(durations)/len(durations)) if durations else 0
     max_dur = max(durations) if durations else 0
-    total_votes = sum((s.get("votes_now", 0) + s.get("votes_later", 0)) for s in sessions)
+    total_votes = sum((int(s.get("votes_now", 0) or 0) + int(s.get("votes_later", 0) or 0)) for s in sessions)
 
-    # Ranking Staff
+    # Ranking de Staff administratores
     staff_count = {}
     for s in sessions:
         name = s.get("opened_by", "Desconocido")
         staff_count[name] = staff_count.get(name, 0) + 1
     staff_ranking = sorted(staff_count.items(), key=lambda x: x[1], reverse=True)[:5]
 
+    # Gráficos de distribución de horas y días
     by_weekday = [0]*7
     by_hour = [0]*24
     recent = []
 
     for s in sessions:
         o_start = s.get("open_start")
-        if o_start:
+        if o_start and isinstance(o_start, datetime):
             if o_start.tzinfo is None:
                 o_start = o_start.replace(tzinfo=timezone.utc)
             local_time = o_start.astimezone(MADRID_TZ)
@@ -97,23 +109,22 @@ def fetch_stats():
     best_hour = f"{by_hour.index(max(by_hour))}:00" if max(by_hour) > 0 else "18:00"
     best_day = DAYS_NAMES[by_weekday.index(max(by_weekday))] if max(by_weekday) > 0 else "Sábado"
 
-    # Procesar historial con horas exactas de Madrid
+    # Estructurar la lista ordenada para la tabla del frontend
     for s in reversed(sessions):
         o_start = s.get("open_start")
         c_time = s.get("close_time")
         
         open_exact = "—"
         close_exact = "En vivo"
+        date_str = "—"
         
-        if o_start:
+        if o_start and isinstance(o_start, datetime):
             if o_start.tzinfo is None:
                 o_start = o_start.replace(tzinfo=timezone.utc)
             open_exact = o_start.astimezone(MADRID_TZ).strftime("%H:%M")
             date_str = o_start.astimezone(MADRID_TZ).strftime("%d/%m")
-        else:
-            date_str = "—"
             
-        if c_time and s.get("status") == "closed":
+        if c_time and s.get("status") == "closed" and isinstance(c_time, datetime):
             if c_time.tzinfo is None:
                 c_time = c_time.replace(tzinfo=timezone.utc)
             close_exact = c_time.astimezone(MADRID_TZ).strftime("%H:%M")
@@ -124,7 +135,7 @@ def fetch_stats():
             "close_exact": close_exact,
             "duration": s.get("duration_minutes", 0) if s.get("status") == "closed" else "En vivo",
             "staff": s.get("opened_by", "—"),
-            "votes": s.get("votes_now", 0) + s.get("votes_later", 0)
+            "votes": int(s.get("votes_now", 0) or 0) + int(s.get("votes_later", 0) or 0)
         })
 
     return {
@@ -144,7 +155,7 @@ def fetch_stats():
     }
 
 # ──────────────────────────────────────────────
-# HTML COMPLETO Y CORREGIDO
+# INTERFAZ WEB HTML / CSS / JS COMPLETA
 # ──────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
 <html lang="es">
@@ -175,7 +186,6 @@ body{
 }
 .container{max-width:1200px;margin:0 auto;padding:2rem 1.5rem}
 
-/* CABECERA */
 .header-panel{
   display:flex;align-items:center;justify-content:space-between;gap:1.5rem;
   background:rgba(11,15,38,0.6);border:1px solid var(--border);
@@ -188,13 +198,9 @@ body{
 h1{font-size:1.6rem;font-weight:800;background:var(--brand-grad);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .subtitle{color:var(--muted);font-size:0.85rem;margin-top:0.15rem}
 
-/* LIVE STATUS BAR */
 .status-container{display:flex;flex-direction:column;align-items:flex-end;gap:0.3rem}
 @media(max-width:768px){.status-container{align-items:center}}
-.status-badge{
-  display:inline-flex;align-items:center;gap:0.6rem;
-  border-radius:999px;padding:0.5rem 1.2rem;font-size:0.85rem;font-weight:700;
-}
+.status-badge{display:inline-flex;align-items:center;gap:0.6rem;border-radius:999px;padding:0.5rem 1.2rem;font-size:0.85rem;font-weight:700}
 .status-badge.open-style{background:rgba(16,185,129,0.12);border:1px solid rgba(16,185,129,0.3);color:var(--green)}
 .status-badge.closed-style{background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.3);color:var(--red)}
 .badge-dot{width:10px;height:10px;border-radius:50%;animation:pulse 2s infinite}
@@ -204,7 +210,6 @@ h1{font-size:1.6rem;font-weight:800;background:var(--brand-grad);-webkit-backgro
 
 @keyframes pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.2);opacity:0.5}}
 
-/* DASHBOARD GRIDS */
 .kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1.25rem;margin-bottom:2rem}
 .main-grid{display:grid;grid-template-columns:1.6fr 1fr;gap:1.25rem;margin-bottom:2rem}
 @media(max-width:900px){.main-grid{grid-template-columns:1fr}}
@@ -217,7 +222,6 @@ h1{font-size:1.6rem;font-weight:800;background:var(--brand-grad);-webkit-backgro
 .kpi-sub{font-size:0.75rem;color:var(--muted);margin-top:0.4rem}
 .section-title{font-size:0.95rem;font-weight:700;margin-bottom:1.25rem;color:var(--text)}
 
-/* GRÁFICO DE LÍNEAS MEJORADO */
 .chart-container{position:relative;width:100%;height:160px;margin-top:1rem;display:flex}
 .chart-y-axis{display:flex;flex-direction:column;justify-content:space-between;font-size:0.65rem;color:var(--muted);padding-right:8px;font-weight:600;text-align:right;width:35px}
 .svg-wrap{flex:1;position:relative;height:100%}
@@ -229,7 +233,6 @@ svg.line-chart{width:100%;height:100%;overflow:visible}
 .chart-xaxis{display:flex;justify-content:space-between;margin-top:0.6rem;margin-left:43px}
 .xaxis-lbl{font-size:0.7rem;color:var(--muted);font-weight:700}
 
-/* COMPACT BARS */
 .bar-chart-compact{display:flex;gap:6px;height:65px;align-items:flex-end;margin-top:1rem}
 .bar-col-c{flex:1;height:100%;display:flex;flex-direction:column;justify-content:flex-end;position:relative}
 .bar-c{width:100%;background:rgba(59,130,246,0.12);border-radius:4px;min-height:3px}
@@ -241,7 +244,6 @@ svg.line-chart{width:100%;height:100%;overflow:visible}
 }
 .bar-col-c:hover .bar-tooltip{opacity:1;transform:translateX(-50%) translateY(0)}
 
-/* RANKING & TABLE */
 .staff-list{display:flex;flex-direction:column;gap:0.7rem}
 .staff-item{display:flex;align-items:center;justify-content:space-between;background:rgba(255,255,255,0.01);padding:0.75rem 1rem;border-radius:12px;border:1px solid var(--border)}
 .staff-name{font-size:0.85rem;font-weight:600}
@@ -282,7 +284,10 @@ footer{display:flex;justify-content:space-between;align-items:center;margin-top:
     </div>
   </div>
 
-  <div id="loading"><div class="spinner"></div>Consultando base de datos...</div>
+  <div id="loading">
+    <div class="spinner"></div>
+    <p id="loading-text">Consultando base de datos...</p>
+  </div>
 
   <div id="content" style="display:none">
     <div class="kpi-grid" id="kpis"></div>
@@ -365,12 +370,23 @@ let initialTimeStr = "";
 async function load(){
   try{
     const r = await fetch('/api/stats');
+    if(!r.ok) {
+       const errData = await r.json();
+       throw new Error(errData.error || "Error al leer los datos de Python.");
+    }
     const d = await r.json();
     render(d);
     document.getElementById('loading').style.display='none';
     document.getElementById('content').style.display='block';
   }catch(e){
-    document.getElementById('loading').innerHTML='<p style="color:#ef4444">Error de conexión.</p>';
+    document.querySelector('.spinner').style.display = 'none';
+    document.getElementById('loading-text').innerHTML = `
+      <span style="color:#ef4444; font-weight:700; font-size:1.1rem;">❌ Error de Comunicación</span><br/>
+      <small style="color:#94a3b8; display:block; margin-top:0.5rem; background:#161930; padding:10px; border-radius:8px; font-family:monospace;">
+        ${e.message}
+      </small>
+      <span style="color:var(--cyan); font-size:0.8rem; display:block; margin-top:1rem;">Asegúrate de permitir el acceso universal (IP 0.0.0.0/0) en Network Access de MongoDB Atlas.</span>
+    `;
   }
 }
 
@@ -388,7 +404,6 @@ function render(d){
   initialTimeStr = d.last_change_time || "";
   liveSecondsElapsed = d.time_elapsed_seconds || 0;
 
-  // Lógica del Cartel de Estado en Vivo superior
   const statusEl = document.getElementById('live-status');
   const textEl = document.getElementById('status-text');
   const infoEl = document.getElementById('status-info');
@@ -402,13 +417,12 @@ function render(d){
   } else {
     statusEl.className = "status-badge closed-style";
     textEl.innerText = "Servidor Cerrado";
-    infoEl.innerText = `Último cierre el ${initialTimeStr}h`;
+    infoEl.innerText = `Último cierre el ${initialTimeStr}`;
   }
 
-  // Cuadros principales
   const kpis=[
     {label:'Historial Registrado', value:d.total_sessions + ' ses.', sub:'Sesiones procesadas', color:'#3b82f6'},
-    {label:'Tiempo Promedio', value:d.avg_duration+' min', sub:'Media abierto', color:#22d3ee'},
+    {label:'Tiempo Promedio', value:d.avg_duration+' min', sub:'Media abierto', color:'#22d3ee'},
     {label:'Hora Más Activa', value:d.best_hour, sub:`Punto fuerte de apertura`, color:'#10b981'},
     {label:'Día Más Activo', value:d.best_day, sub:'Día con mayor frecuencia', color:'#a855f7'}
   ];
@@ -419,13 +433,11 @@ function render(d){
       <p class="kpi-sub">${k.sub}</p>
     </div>`).join('');
 
-  // RENDER COMPLETO DEL GRÁFICO DE LÍNEAS CON EJES EXÁCTOS
   if(d.recent && d.recent.length > 0){
     const width = 500; const height = 110; const padding = 15;
     const numericDurations = d.recent.map(s => typeof s.duration === 'number' ? s.duration : 0);
     const maxDur = Math.max(...numericDurations, 60);
     
-    // Rellenar eje Y de minutos informativo
     document.getElementById('chart-y-axis').innerHTML = `
       <span>${maxDur}m</span>
       <span>${Math.round(maxDur/2)}m</span>
@@ -456,7 +468,6 @@ function render(d){
     `).join('');
   }
 
-  // Lista de Staff
   document.getElementById('staff-ranking').innerHTML = d.staff_ranking.length
     ? d.staff_ranking.map((s,i)=>`
       <div class="staff-item">
@@ -465,7 +476,6 @@ function render(d){
       </div>`).join('')
     : '<p style="color:var(--muted)">Sin datos</p>';
 
-  // Días Spark
   const maxW = Math.max(...d.by_weekday, 1);
   document.getElementById('weekday-chart').innerHTML = d.by_weekday.map((v,i)=>`
     <div class="bar-col-c">
@@ -473,7 +483,6 @@ function render(d){
       <div class="bar-c" style="height:${Math.round(v/maxW*100)}%"></div>
     </div>`).join('');
 
-  // Horas Spark
   const maxH = Math.max(...d.by_hour, 1);
   document.getElementById('hour-chart').innerHTML = d.by_hour.map((v,i)=>`
     <div class="bar-col-c">
@@ -481,7 +490,6 @@ function render(d){
       <div class="bar-c" style="height:${Math.round(v/maxH*100)}%; background:rgba(168,85,247,0.15)"></div>
     </div>`).join('');
 
-  // Tabla con Horas exactas
   const tableData = [...d.recent].reverse();
   document.getElementById('recent-table').innerHTML = tableData.length
     ? tableData.map(s=>`
@@ -497,14 +505,14 @@ function render(d){
 }
 
 load();
-setInterval(load, 45000);        // Actualiza datos de la DB cada 45 segundos
-setInterval(updateLiveCounter, 1000); // Suma un segundo al reloj local en vivo cada segundo
+setInterval(load, 30000); 
+setInterval(updateLiveCounter, 1000);
 </script>
 </body>
 </html>"""
 
 # ──────────────────────────────────────────────
-# HANDLER VERCEL HTTP
+# HANDLER PRINCIPAL DE VERCEL (ENTRADA HTTP)
 # ──────────────────────────────────────────────
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -516,14 +524,15 @@ class handler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Cache-Control", "s-maxage=20")
+                self.send_header("Cache-Control", "s-maxage=10")
                 self.end_headers()
                 self.wfile.write(body)
             except Exception as e:
+                # Si ocurre un error, se envía al frontend de manera controlada para pintar el aviso
                 self.send_response(500)
                 self.send_header("Content-Type","application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps({"error":str(e)}).encode())
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
         else:
             body = HTML.encode()
             self.send_response(200)
