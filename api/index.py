@@ -21,6 +21,20 @@ def get_db():
     client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=4000)
     return client[DB_NAME]["sbrp_sessions"]
 
+def fmt_duration(minutes):
+    """Convierte minutos a string legible: '1h 30m', '45m', '2h'"""
+    if not minutes or not isinstance(minutes, (int, float)):
+        return "—"
+    minutes = int(minutes)
+    h = minutes // 60
+    m = minutes % 60
+    if h > 0 and m > 0:
+        return f"{h}h {m}m"
+    elif h > 0:
+        return f"{h}h"
+    else:
+        return f"{m}m"
+
 # ──────────────────────────────────────────────
 # LÓGICA DE PROCESAMIENTO DE ESTADÍSTICAS
 # ──────────────────────────────────────────────
@@ -37,7 +51,9 @@ def fetch_stats():
             "time_elapsed_seconds": 0,
             "total_sessions": 0,
             "avg_duration": 0,
+            "avg_duration_fmt": "—",
             "max_duration": 0,
+            "max_duration_fmt": "—",
             "total_votes": 0,
             "best_hour": "—",
             "best_day": "—",
@@ -129,11 +145,14 @@ def fetch_stats():
                 c_time = c_time.replace(tzinfo=timezone.utc)
             close_exact = c_time.astimezone(MADRID_TZ).strftime("%H:%M")
 
+        dur_minutes = s.get("duration_minutes", 0) if s.get("status") == "closed" else None
+
         recent.append({
             "date": date_str,
             "open_exact": open_exact,
             "close_exact": close_exact,
-            "duration": s.get("duration_minutes", 0) if s.get("status") == "closed" else "En vivo",
+            "duration": dur_minutes,           # número en minutos (o null si en vivo)
+            "duration_fmt": fmt_duration(dur_minutes) if dur_minutes is not None else "En vivo",
             "staff": s.get("opened_by", "—"),
             "votes": int(s.get("votes_now", 0) or 0) + int(s.get("votes_later", 0) or 0)
         })
@@ -144,7 +163,9 @@ def fetch_stats():
         "time_elapsed_seconds": time_elapsed_seconds,
         "total_sessions": len(sessions),
         "avg_duration": avg_dur,
+        "avg_duration_fmt": fmt_duration(avg_dur),
         "max_duration": max_dur,
+        "max_duration_fmt": fmt_duration(max_dur),
         "total_votes": total_votes,
         "best_hour": best_hour,
         "best_day": best_day,
@@ -223,14 +244,14 @@ h1{font-size:1.6rem;font-weight:800;background:var(--brand-grad);-webkit-backgro
 .section-title{font-size:0.95rem;font-weight:700;margin-bottom:1.25rem;color:var(--text)}
 
 .chart-container{position:relative;width:100%;height:160px;margin-top:1rem;display:flex}
-.chart-y-axis{display:flex;flex-direction:column;justify-content:space-between;font-size:0.65rem;color:var(--muted);padding-right:8px;font-weight:600;text-align:right;width:35px}
+.chart-y-axis{display:flex;flex-direction:column;justify-content:space-between;font-size:0.65rem;color:var(--muted);padding-right:8px;font-weight:600;text-align:right;width:42px}
 .svg-wrap{flex:1;position:relative;height:100%}
 svg.line-chart{width:100%;height:100%;overflow:visible}
 .chart-line{fill:none;stroke:url(#line-grad);stroke-width:4;stroke-linecap:round}
 .chart-area{fill:url(#area-grad);opacity:0.08}
 .chart-dot{fill:var(--bg);stroke:var(--cyan);stroke-width:3;cursor:pointer}
 .chart-dot:hover{r:6.5;fill:var(--cyan)}
-.chart-xaxis{display:flex;justify-content:space-between;margin-top:0.6rem;margin-left:43px}
+.chart-xaxis{display:flex;justify-content:space-between;margin-top:0.6rem;margin-left:50px}
 .xaxis-lbl{font-size:0.7rem;color:var(--muted);font-weight:700}
 
 .bar-chart-compact{display:flex;gap:6px;height:65px;align-items:flex-end;margin-top:1rem}
@@ -294,7 +315,7 @@ footer{display:flex;justify-content:space-between;align-items:center;margin-top:
 
     <div class="main-grid">
       <div class="card">
-        <p class="section-title">📈 Duración histórica (Minutos que se mantuvo abierto)</p>
+        <p class="section-title">📈 Duración histórica (tiempo que se mantuvo abierto)</p>
         <div class="chart-container">
           <div class="chart-y-axis" id="chart-y-axis"></div>
           <div class="svg-wrap">
@@ -367,6 +388,26 @@ let liveSecondsElapsed = 0;
 let serverStatusGlobal = "closed";
 let initialTimeStr = "";
 
+// Formatea minutos a "1h 30m", "45m", "2h", etc.
+function fmtDur(minutes) {
+  if (minutes === null || minutes === undefined || isNaN(minutes)) return "—";
+  minutes = Math.round(minutes);
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  if (h > 0 && m > 0) return `${h}h ${m}m`;
+  if (h > 0) return `${h}h`;
+  return `${m}m`;
+}
+
+// Formatea segundos a "1h 30m" para el contador en vivo
+function fmtSeconds(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (h > 0 && m > 0) return `${h}h y ${m}m`;
+  if (h > 0) return `${h}h`;
+  return `${m}m`;
+}
+
 async function load(){
   try{
     const r = await fetch('/api/stats');
@@ -393,9 +434,7 @@ async function load(){
 function updateLiveCounter() {
   if (serverStatusGlobal === "open") {
     liveSecondsElapsed++;
-    const hrs = Math.floor(liveSecondsElapsed / 3600);
-    const mins = Math.floor((liveSecondsElapsed % 3600) / 60);
-    document.getElementById('status-info').innerText = `Abrió a las ${initialTimeStr}h (Lleva activo: ${hrs}h y ${mins}m)`;
+    document.getElementById('status-info').innerText = `Abrió a las ${initialTimeStr}h (Lleva activo: ${fmtSeconds(liveSecondsElapsed)})`;
   }
 }
 
@@ -411,9 +450,7 @@ function render(d){
   if(d.server_status === "open"){
     statusEl.className = "status-badge open-style";
     textEl.innerText = "Servidor Abierto";
-    const hrs = Math.floor(liveSecondsElapsed / 3600);
-    const mins = Math.floor((liveSecondsElapsed % 3600) / 60);
-    infoEl.innerText = `Abrió a las ${initialTimeStr}h (Lleva activo: ${hrs}h y ${mins}m)`;
+    infoEl.innerText = `Abrió a las ${initialTimeStr}h (Lleva activo: ${fmtSeconds(liveSecondsElapsed)})`;
   } else {
     statusEl.className = "status-badge closed-style";
     textEl.innerText = "Servidor Cerrado";
@@ -422,7 +459,7 @@ function render(d){
 
   const kpis=[
     {label:'Historial Registrado', value:d.total_sessions + ' ses.', sub:'Sesiones procesadas', color:'#3b82f6'},
-    {label:'Tiempo Promedio', value:d.avg_duration+' min', sub:'Media abierto', color:'#22d3ee'},
+    {label:'Tiempo Promedio', value: d.avg_duration_fmt, sub:'Media abierto', color:'#22d3ee'},
     {label:'Hora Más Activa', value:d.best_hour, sub:`Punto fuerte de apertura`, color:'#10b981'},
     {label:'Día Más Activo', value:d.best_day, sub:'Día con mayor frecuencia', color:'#a855f7'}
   ];
@@ -438,9 +475,10 @@ function render(d){
     const numericDurations = d.recent.map(s => typeof s.duration === 'number' ? s.duration : 0);
     const maxDur = Math.max(...numericDurations, 60);
     
+    // Eje Y en horas
     document.getElementById('chart-y-axis').innerHTML = `
-      <span>${maxDur}m</span>
-      <span>${Math.round(maxDur/2)}m</span>
+      <span>${fmtDur(maxDur)}</span>
+      <span>${fmtDur(Math.round(maxDur/2))}</span>
       <span>0m</span>
     `;
 
@@ -459,7 +497,7 @@ function render(d){
 
     document.getElementById('chart-dots').innerHTML = points.map(p => `
       <circle class="chart-dot" cx="${p.x}" cy="${p.y}" r="4.5">
-        <title>Día ${p.date} - Duración: ${p.duration} min</title>
+        <title>Día ${p.date} - Duración: ${p.duration_fmt}</title>
       </circle>
     `).join('');
 
@@ -498,7 +536,7 @@ function render(d){
         <td><span class="time-label">⏰ ${s.open_exact}h</span></td>
         <td><span class="time-label">${s.close_exact === "En vivo" ? '🟢 En línea' : '🚪 ' + s.close_exact + 'h'}</span></td>
         <td><b>${s.staff}</b></td>
-        <td><span class="${typeof s.duration === 'number' ? 'dur-tag' : 'dur-live'}">${typeof s.duration === 'number' ? s.duration + ' min' : 'Abierto ⚡'}</span></td>
+        <td><span class="${s.duration !== null ? 'dur-tag' : 'dur-live'}">${s.duration !== null ? s.duration_fmt : 'Abierto ⚡'}</span></td>
         <td style="font-weight:700;color:#f43f5e">${s.votes} votos</td>
       </tr>`).join('')
     : '<tr><td colspan="6" style="text-align:center;color:var(--muted)">Ningún registro activo</td></tr>';
